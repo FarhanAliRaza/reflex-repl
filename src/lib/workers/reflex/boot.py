@@ -1,10 +1,17 @@
 """Install the latest Reflex into Pyodide with no server (run via runPythonAsync).
 
-Forces Pyodide's prebuilt pydantic 2.10.6 / pydantic_core 2.27.2 (Reflex's
->=2.12 pin is conservative and it runs fine on these), installs the reflex
-packages with deps=False to skip that pin, and stubs `granian` (a Rust server
-binary that won't run here, and which reflex_base's deprecation logger imports).
-Binary prebuilts (pydantic*, ssl, sqlite3, ...) are loaded from JS beforehand.
+Installs the reflex packages with deps=False because reflex hard-requires
+`granian` (a Rust ASGI server with no wasm wheel); micropip can't resolve that
+tree, and it has no "install all but one" flag, so we skip resolution entirely
+and hand-install the pure-Python runtime deps ourselves (_LEAF). Reflex's
+pydantic>=2.12 pin is satisfied natively now: Pyodide 0.29.4 ships pydantic
+2.12.5 / pydantic_core 2.41.5 as prebuilt wheels (loaded from JS beforehand,
+alongside ssl/sqlite3/...), so no version pinning is needed. Also stubs `granian`
+— reflex_base's deprecation logger does `import granian` for frame inspection,
+even though the package is never installed.
+
+Each micropip.install gets a *list*, so all wheels in that batch download
+concurrently instead of one serial await per package.
 """
 
 import sys
@@ -19,10 +26,9 @@ if "granian" not in sys.modules:
     _g.__file__ = "/granian_stub/__init__.py"
     sys.modules["granian"] = _g
 
-_CONSTRAINTS = ["pydantic==2.10.6", "pydantic-core==2.27.2"]
-
-# reflex + its split packages: install WITHOUT deps so the pydantic>=2.12 pin is
-# never resolved (it would demand pydantic-core 2.46.4, which has no wasm wheel).
+# reflex + its split packages: install WITHOUT deps so micropip never tries to
+# resolve `granian` (Rust ASGI server, no wasm wheel). The real pure-Python deps
+# are installed via _LEAF below.
 _NODEPS = [
     "reflex", "reflex-base",
     "reflex-components-code", "reflex-components-core", "reflex-components-dataeditor",
@@ -42,17 +48,18 @@ _LEAF = [
     "anyio",
 ]
 
+# Batched installs: passing a list lets micropip download every wheel in the
+# batch concurrently. The two batches differ only by deps= (reflex skips
+# resolution, leaves resolve their own pure-Python deps).
 _fails = []
-for _spec in _NODEPS:
-    try:
-        await micropip.install(_spec, deps=False)
-    except Exception as _e:  # noqa: BLE001
-        _fails.append([_spec, str(_e)[:160]])
-for _spec in _LEAF:
-    try:
-        await micropip.install(_spec, deps=True, constraints=_CONSTRAINTS)
-    except Exception as _e:  # noqa: BLE001
-        _fails.append([_spec, str(_e)[:160]])
+try:
+    await micropip.install(_NODEPS, deps=False)
+except Exception as _e:  # noqa: BLE001
+    _fails.append(["reflex-packages", str(_e)[:200]])
+try:
+    await micropip.install(_LEAF, deps=True)
+except Exception as _e:  # noqa: BLE001
+    _fails.append(["leaf-deps", str(_e)[:200]])
 
 import reflex as rx  # noqa: E402,F401  (warm the import; surfaces failures now)
 from importlib.metadata import version  # noqa: E402

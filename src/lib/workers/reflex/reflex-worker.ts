@@ -6,11 +6,12 @@
 import bootPy from './boot.py?raw';
 import bridgePy from './bridge.py?raw';
 
-const PYODIDE_VERSION = '0.29.0';
+const PYODIDE_VERSION = '0.29.4';
 const CDN = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
 
 // Prebuilt (incl. native) wheels loaded from Pyodide's repo before installing Reflex.
-// pydantic/pydantic_core lock the versions Reflex is forced onto; ssl is required
+// pydantic/pydantic_core: 0.29.4 ships 2.12.5 / 2.41.5, which satisfy Reflex's
+// pydantic>=2.12 pin natively (no version forcing needed); ssl is required
 // (redis touches ssl.VerifyMode at import); sqlite3 backs the DB layer.
 const PREBUILT = [
 	'micropip',
