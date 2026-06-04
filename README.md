@@ -94,6 +94,56 @@ inter-file imports, computed vars, and standard event handlers. Some build-time-
 features (those that require a Node/Vite toolchain at runtime) are not available. This
 is an experimental project — expect rough edges on advanced or unusual apps.
 
+### Known limitations
+
+The **frontend is high-fidelity** — real React, the full component library, and most
+third-party React libraries render faithfully. The gaps below come from the **event
+bridge in `bridge.py` being a deliberately thin slice** of Reflex's real pipeline, plus
+the no-server / no-bundler setup.
+
+**Event pipeline**
+
+- **`on_load` events don't fire.** `dispatch_event` skips any handler whose name starts
+  with `on_load`, so page-load handlers — initial data fetches, load-time redirects,
+  etc. — never run.
+- **Returned / "special" events are dropped.** The bridge always returns `"events": []`,
+  so events a handler *returns or yields* never reach the client: `rx.redirect`,
+  `rx.toast`, `rx.download`, `rx.call_script`, `rx.set_clipboard`, `rx.set_focus`, and
+  **event chaining** (one handler triggering another).
+- **No streaming / incremental `yield`.** For generator handlers, the bridge drains the
+  generator and sends only the **final** state delta — intermediate `yield` updates and
+  background-task progress don't stream.
+- **Async computed vars are unreliable.** To avoid threads (which Pyodide lacks),
+  `compile_state` is resolved synchronously, which can break `@rx.var`s defined `async`.
+
+**Transports**
+
+- **File uploads don't work.** Reflex uses two transports: a websocket for normal events
+  (swapped for `postMessage`) and a separate **HTTP `POST /_upload/`** for `rx.upload`.
+  Only the websocket is shimmed, so the upload request hits a backend that isn't there
+  and silently fails — `handle_upload` never runs. Wiring it up means intercepting the
+  upload `XMLHttpRequest` in the iframe (the way `socket.io-client` is shimmed),
+  forwarding the bytes to the worker, and handling them in `bridge.py`. More broadly,
+  anything assuming a live HTTP endpoint *other than the socket* needs its own shim.
+
+**npm / frontend packages**
+
+- **Custom components load from a CDN at _latest_, not installed — pinned versions are
+  ignored.** There's no `npm install` (it's stubbed in the Pyodide compiler patch). A
+  custom component's `library = "foo@1.2.3"` has its version **stripped** at compile time,
+  so the import resolves to `https://esm.sh/foo` at whatever is latest. Many libraries
+  work with zero setup, but you can't pin a version from app code — only by editing the
+  `PIN` map in `client.ts`. Libraries that aren't usable as browser ESM (Node-only APIs,
+  non-ESM builds, CSS side-effect imports) won't load.
+- **Only static imports are detected.** The compiled output is scanned for `from "..."`
+  imports; dynamic `import(...)` and side-effect `import "x"` are not picked up, so those
+  packages never make it into the import map.
+
+**Build-time features**
+
+- **Anything needing a Node/Vite/bun toolchain at runtime is unavailable.** The Reflex
+  compiler runs in Pyodide, but there's no bundler or package installer in the browser.
+
 ## Project structure
 
 ```
