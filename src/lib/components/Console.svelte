@@ -1,0 +1,73 @@
+<script lang="ts">
+	import { executionState } from '$lib/stores/execution.svelte';
+	import type { LogEntry } from '$lib/types';
+	import { Terminal, Trash2 } from '@lucide/svelte';
+
+	function formatTime(timestamp: number): string {
+		return new Date(timestamp).toLocaleTimeString();
+	}
+
+	function getLogClass(type: LogEntry['type']): string {
+		switch (type) {
+			case 'success':
+				return 'log-success';
+			case 'error':
+				return 'log-error';
+			case 'warning':
+				return 'log-warning';
+			default:
+				return 'log-info';
+		}
+	}
+
+	function clearConsole() {
+		executionState.clearLogs();
+	}
+</script>
+
+<div class="flex h-full flex-col bg-background text-foreground">
+	<div class="flex shrink-0 items-center justify-between border-b border-border bg-card px-3 py-2">
+		<div class="flex items-center gap-2 text-sm text-muted-foreground">
+			<Terminal class="size-4" />
+			<span>Console</span>
+		</div>
+		<div class="flex gap-1.5">
+			<button
+				class="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-destructive hover:text-white"
+				onclick={clearConsole}
+			>
+				<Trash2 class="size-3" />
+			</button>
+		</div>
+	</div>
+	<div class="flex-1 overflow-y-auto p-3 font-mono text-sm leading-relaxed">
+		{#if executionState.logs.length === 0}
+			<div class="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
+				<Terminal class="size-8 opacity-40" />
+				<p class="text-sm">No logs yet</p>
+			</div>
+		{:else}
+			{#each executionState.logs as log, index (index)}
+				<div class="my-1 break-words whitespace-pre-wrap {getLogClass(log.type)}">
+					<span class="mr-2 text-muted-foreground/70">[{formatTime(log.timestamp)}]</span>
+					<span>{log.message}</span>
+				</div>
+			{/each}
+		{/if}
+	</div>
+</div>
+
+<style>
+	.log-success {
+		color: oklch(0.696 0.17 162.48);
+	}
+	.log-error {
+		color: var(--destructive);
+	}
+	.log-warning {
+		color: oklch(0.828 0.189 84.429);
+	}
+	.log-info {
+		color: var(--muted-foreground);
+	}
+</style>
