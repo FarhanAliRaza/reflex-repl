@@ -252,6 +252,47 @@ def _serialize_events(events) -> list:
     ]
 
 
+def _make_push(collected: list, emit):
+    """A `_push(update)` that collects updates and streams each via `emit`."""
+
+    def _push(update: dict) -> None:
+        # Drop no-op updates so streaming doesn't spam empty frames.
+        if not update.get("delta") and not update.get("events") and not update.get("error"):
+            return
+        collected.append(update)
+        if emit is not None:
+            emit(json.dumps(update, default=str))
+
+    return _push
+
+
+def _collecting_event_context(push):
+    """An EventContext whose emit hooks stream each StateUpdate via `push`.
+
+    emit_delta → state delta; emit_event → frontend events; enqueue → chained
+    backend events (forwarded for state.js to re-emit). Shared by dispatch_event
+    and dispatch_upload so both honor Reflex's real pipeline output.
+    """
+    from reflex_base.event.context import EventContext
+
+    async def _emit_delta(token, delta):
+        push({"delta": dict(delta), "events": [], "final": False})
+
+    async def _emit_event(token, *events):
+        push({"delta": {}, "events": _serialize_events(events), "final": False})
+
+    async def _enqueue(token, *events):
+        push({"delta": {}, "events": _serialize_events(events), "final": False})
+
+    return EventContext(
+        token="repl",
+        state_manager=_state_manager,
+        enqueue_impl=_enqueue,
+        emit_delta_impl=_emit_delta,
+        emit_event_impl=_emit_event,
+    )
+
+
 async def dispatch_event(msg, emit=None) -> dict:
     """Run a Reflex Event dict through Reflex's REAL event pipeline.
 
@@ -273,14 +314,7 @@ async def dispatch_event(msg, emit=None) -> dict:
     updates are only collected. Returns a small status `{final, n}`.
     """
     collected: list = []
-
-    def _push(update: dict) -> None:
-        # Drop no-op updates so streaming doesn't spam empty frames.
-        if not update.get("delta") and not update.get("events") and not update.get("error"):
-            return
-        collected.append(update)
-        if emit is not None:
-            emit(json.dumps(update, default=str))
+    _push = _make_push(collected, emit)
 
     if _root is None:
         _push({"delta": {}, "events": [], "final": True, "error": "no app"})
@@ -303,25 +337,7 @@ async def dispatch_event(msg, emit=None) -> dict:
         _root.router_data = router_data
         _root.router = RouterData.from_router_data(router_data)
 
-    # An EventContext whose emit hooks stream each update as the real pipeline
-    # produces it. emit_delta → state delta; emit_event → frontend events;
-    # enqueue → chained backend events (forwarded for state.js to re-emit).
-    async def _emit_delta(token, delta):
-        _push({"delta": dict(delta), "events": [], "final": False})
-
-    async def _emit_event(token, *events):
-        _push({"delta": {}, "events": _serialize_events(events), "final": False})
-
-    async def _enqueue(token, *events):
-        _push({"delta": {}, "events": _serialize_events(events), "final": False})
-
-    ctx = EventContext(
-        token="repl",
-        state_manager=_state_manager,
-        enqueue_impl=_enqueue,
-        emit_delta_impl=_emit_delta,
-        emit_event_impl=_emit_event,
-    )
+    ctx = _collecting_event_context(_push)
     ctx_token = EventContext.set(ctx)
     try:
         # First dispatch hydrates: the client needs the FULL initial state (a
@@ -347,6 +363,85 @@ async def dispatch_event(msg, emit=None) -> dict:
                 await process_event(
                     handler=handler, payload=payload, state=sub, root_state=_root
                 )
+    finally:
+        EventContext.reset(ctx_token)
+
+    return {"final": True, "n": len(collected)}
+
+
+async def dispatch_upload(msg, emit=None) -> dict:
+    """Handle an `rx.upload` whose files the iframe forwarded over postMessage.
+
+    Reflex uploads go over a SEPARATE HTTP `POST /_upload/`, not the socket —
+    there's no server here, so client.ts replaces Reflex's `uploadFiles` helper
+    with one that posts the file bytes to the worker instead. This rebuilds the
+    `UploadFile` list (the real `_upload_buffered_file` does the same from the
+    multipart body), runs the genuine upload handler through the pipeline, and
+    streams the resulting deltas/events back exactly like a normal event — so
+    progress `yield`s and returned events work too.
+
+    `msg` is `{name: "<state>.<handler>", files: [{name, b64}, …]}`. `emit` is
+    the worker's per-update callback (same contract as dispatch_event).
+    """
+    collected: list = []
+    _push = _make_push(collected, emit)
+
+    if _root is None:
+        _push({"delta": {}, "events": [], "final": True, "error": "no app"})
+        return {"final": True, "n": len(collected)}
+
+    import base64
+    import tempfile
+    from pathlib import Path
+
+    from reflex_base.event import resolve_upload_handler_param
+    from reflex_base.event.context import EventContext
+    from reflex_base.event.processor.base_state_processor import process_event
+    from reflex_components_core.core._upload import UploadFile
+    from starlette.datastructures import Headers
+
+    name = msg.get("name") or msg.get("handler") or ""
+    files_in = msg.get("files") or []
+    sfn, _, fn = name.rpartition(".")
+    cls = _subs.get(sfn)
+    handler = cls.event_handlers.get(fn) if cls is not None else None
+    if handler is None:
+        _push({"delta": {}, "events": [], "final": True, "error": f"no upload handler '{name}'"})
+        return {"final": True, "n": len(collected)}
+
+    # The handler's `list[rx.UploadFile]` parameter name (what the payload keys on).
+    try:
+        param_name, _ann = resolve_upload_handler_param(handler)
+    except Exception:
+        param_name = "files"
+
+    uploads = []
+    for f in files_in:
+        data = base64.b64decode(f.get("b64") or "")
+        # Back each file with an *unrolled* SpooledTemporaryFile so Starlette's
+        # UploadFile.read() takes the in-memory branch (a plain BytesIO has no
+        # `_rolled`, which would route read() through a threadpool — Pyodide has
+        # no threads).
+        spool = tempfile.SpooledTemporaryFile(max_size=len(data) + 1)
+        spool.write(data)
+        spool.seek(0)
+        fname = f.get("name") or "upload"
+        uploads.append(
+            UploadFile(
+                file=spool,
+                path=Path(fname.lstrip("/")),
+                size=len(data),
+                headers=Headers(),
+            )
+        )
+
+    ctx = _collecting_event_context(_push)
+    ctx_token = EventContext.set(ctx)
+    try:
+        sub = await _root.get_state(cls)
+        await process_event(
+            handler=handler, payload={param_name: uploads}, state=sub, root_state=_root
+        )
     finally:
         EventContext.reset(ctx_token)
 

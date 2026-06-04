@@ -75,14 +75,20 @@ console) on the right. It owns the worker and brokers all messages between the w
      incremental generator `yield`s, and `on_load` (the internal `on_load_internal` handler is
      allowed to run) work. First dispatch still hydrates the full state tree (a delta only
      carries dirty vars). Headless harnesses call it with `emit=None` and just collect updates.
+     `dispatch_upload` handles `rx.upload`: Reflex POSTs files to a separate HTTP `/_upload/`
+     endpoint (no server here), so the file bytes are forwarded from the iframe instead; it
+     rebuilds the `UploadFile` list and runs the real upload handler through the same pipeline.
    - **Simple HTML-render path (legacy):** `run_app()` / `run_event()` / `ReflexApp` / `_render`.
      **Not wired into the worker** — it renders `rx.el` to plain HTML and exists for the headless
      harnesses. If you're fixing what the app actually shows, edit the parity path, not this one.
 4. **`client.ts`** (`buildParitySrcdoc`) — assembles the sandboxed-iframe document with **no
    bundler**: npm deps load from `esm.sh`, compiled `$/...` modules are served as data-URL ES
    modules via an import map, and `socket.io-client` is replaced by `SOCKET_SHIM` that bridges
-   Reflex's socket to `postMessage`. React/react-dom/emotion are pinned and forced to a *single*
-   instance via the import map + `?external` — a second React copy breaks hooks/context.
+   Reflex's socket to `postMessage`. `$/utils/helpers/upload` is likewise replaced by
+   `UPLOAD_SHIM` (no `/_upload/` HTTP endpoint exists) — it posts file bytes to the worker and
+   lets the resulting deltas return through the normal `rx-recv` path. React/react-dom/emotion
+   are pinned and forced to a *single* instance via the import map + `?external` — a second React
+   copy breaks hooks/context.
 5. **`Output.svelte`** — renders the iframe from a **Blob URL, not `srcdoc`** (import maps are
    flaky inside `srcdoc`). Relays events both ways.
 
@@ -92,6 +98,11 @@ iframe Reflex runtime emits → `SOCKET_SHIM` posts `rx-emit` to parent → `Out
 more `StateUpdate`s streamed back as separate `update` messages → `+page.svelte` →
 `Output.applyUpdate` posts each `rx-recv` into iframe → Reflex's `state.js` applies the delta
 (and re-emits any chained backend events, closing the loop) → React re-renders.
+
+`rx.upload` takes a parallel path on the way in: `UPLOAD_SHIM`'s `uploadFiles` posts `rx-upload`
+(handler + file bytes as base64) → `Output.svelte` → `+page.svelte` `onUpload` → worker `upload`
+→ `dispatch_upload`. The resulting `StateUpdate`s come back through the same `update`/`rx-recv`
+path as normal events.
 
 ### User app conventions
 - Entry file is `app.py`; it must define `index()` (or `page()`) returning a component.

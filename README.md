@@ -32,6 +32,8 @@ framework, so most Reflex apps render the same as they would in production.
 - **Real Reflex** — the actual framework running server-less in WebAssembly
 - **Full Radix component library** — `rx.button`, `rx.card`, `rx.vstack`, charts, etc.
 - **Live state & events** — `on_click`, `on_change`, `on_input`, … round-trip through Reflex's real event loop
+- **Returned events & chaining** — `rx.redirect`, `rx.toast`, `rx.download`, and one handler triggering another
+- **File uploads** — `rx.upload` works without a server (file bytes are forwarded to the worker)
 - **Multi-file projects** — split your app across files with inter-file imports
 - **Hot reload** — Refresh re-runs your code and resets state cleanly
 - **CodeMirror editor** — Python syntax highlighting, autocomplete, search
@@ -101,8 +103,8 @@ is an experimental project — expect rough edges on advanced or unusual apps.
 The **frontend is high-fidelity** — real React, the full component library, and most
 third-party React libraries render faithfully. `dispatch_event` in `bridge.py` now drives
 Reflex's **real event pipeline** (`process_event`), so returned events, event chaining,
-incremental `yield` streaming, `on_load`, and `async @rx.var`s all work. The remaining
-gaps come from the no-server / no-bundler setup and Reflex's second HTTP transport.
+incremental `yield` streaming, `on_load`, `async @rx.var`s, and `rx.upload` file uploads
+all work. The remaining gaps come from the no-server / no-bundler setup.
 
 **Page-load handlers (`on_load`)**
 
@@ -110,16 +112,6 @@ gaps come from the no-server / no-bundler setup and Reflex's second HTTP transpo
   you, so it picks up a page-load handler from a **module-level `on_load`** in `app.py`
   (e.g. `on_load = State.load_data`, or a list of handlers) rather than from
   `@rx.page(on_load=...)`.
-
-**Transports**
-
-- **File uploads don't work.** Reflex uses two transports: a websocket for normal events
-  (swapped for `postMessage`) and a separate **HTTP `POST /_upload/`** for `rx.upload`.
-  Only the websocket is shimmed, so the upload request hits a backend that isn't there
-  and silently fails — `handle_upload` never runs. Wiring it up means intercepting the
-  upload `XMLHttpRequest` in the iframe (the way `socket.io-client` is shimmed),
-  forwarding the bytes to the worker, and handling them in `bridge.py`. More broadly,
-  anything assuming a live HTTP endpoint *other than the socket* needs its own shim.
 
 **npm / frontend packages**
 

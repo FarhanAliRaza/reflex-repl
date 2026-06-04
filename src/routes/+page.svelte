@@ -89,6 +89,12 @@
 		worker?.postMessage({ type: 'event', payload: { event } });
 	}
 
+	// An rx.upload bubbled up from the iframe → run the upload handler in the
+	// worker; the resulting StateUpdate(s) come back as 'update' messages.
+	function onUpload(upload: Record<string, unknown>) {
+		worker?.postMessage({ type: 'upload', payload: { upload } });
+	}
+
 	// Load a shared project from the URL hash, if one is present.
 	function loadProjectFromHash() {
 		shareState.loadFromHash().then((sharedData) => {
@@ -229,7 +235,14 @@
 			<Resizable.Handle withHandle={true} />
 			<Resizable.Pane defaultSize={50}>
 				<div class="h-full w-full overflow-hidden">
-					<Output {bundle} error={errorText} {renderId} {onEvent} bind:this={outputRef} />
+					<Output
+						{bundle}
+						error={errorText}
+						{renderId}
+						{onEvent}
+						{onUpload}
+						bind:this={outputRef}
+					/>
 				</div>
 			</Resizable.Pane>
 		</Resizable.PaneGroup>

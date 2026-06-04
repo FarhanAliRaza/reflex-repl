@@ -67,6 +67,52 @@ export default function io(url, opts) {
 }
 `;
 
+// Replacement for Reflex's upload helper ($/utils/helpers/upload). Reflex uploads
+// files over a separate HTTP POST /_upload/ — there's no server, so instead of
+// the real XHR we read the file bytes and post them to the worker (rx-upload).
+// The handler runs there and the resulting state deltas come back through the
+// normal rx-recv → state.js path, so we don't process the response here.
+const UPLOAD_SHIM = String.raw`
+const toBase64 = (buf) => {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+};
+export const uploadFiles = async (
+  handler, files, upload_id, on_upload_progress, extra_headers,
+  socket, refs, getBackendURL, getToken,
+) => {
+  files = files ?? [];
+  const upload_ref_name = "__upload_controllers_" + upload_id;
+  if (refs[upload_ref_name]) { console.log("Upload already in progress for ", upload_id); return false; }
+  refs[upload_ref_name] = true;
+  try {
+    const encoded = await Promise.all(files.map(async (file) => ({
+      name: file.path || file.name,
+      b64: toBase64(await file.arrayBuffer()),
+    })));
+    // No byte-by-byte transfer here, so report the upload as complete at once.
+    if (on_upload_progress) {
+      try { on_upload_progress({ loaded: 1, total: 1, progress: 1 }); } catch (e) {}
+    }
+    parent.postMessage(
+      { type: "rx-upload", upload: { name: handler, upload_id, files: encoded } },
+      "*",
+    );
+    return true;
+  } catch (e) {
+    console.log("Upload error:", e && e.message);
+    return false;
+  } finally {
+    delete refs[upload_ref_name];
+  }
+};
+`;
+
 // Mounts the compiled page through Reflex's real providers (memory router so the
 // widget owns its URL space). EventLoopProvider opens the (shimmed) socket.
 const BOOT = String.raw`
@@ -111,6 +157,9 @@ export function buildParitySrcdoc(bundle: ReflexBundle): string {
 		if (rel.endsWith('.css')) continue; // CSS imports handled via <link>, not modules
 		dollar['$/' + rel.replace(/\.jsx?$/, '')] = src; // $/utils/context, $/app/routes/_index, $/utils/components/*
 	}
+	// Override Reflex's shipped upload helper (added by the runtime loop above)
+	// with the postMessage-based one — there's no /_upload/ HTTP endpoint here.
+	dollar['$/utils/helpers/upload'] = UPLOAD_SHIM;
 
 	// Every package must import BARE "react"/"react-dom" so the import map routes
 	// them to the single pinned instance below. Using esm.sh ?deps= here instead

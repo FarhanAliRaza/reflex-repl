@@ -101,6 +101,25 @@ except Exception:
 	return { type: 'noop' };
 }
 
+async function handleUpload(uploadDict: Record<string, unknown>) {
+	if (!pyodide) throw new Error('worker not initialized');
+	// rx.upload normally POSTs to a separate HTTP /_upload/ endpoint; there's no
+	// server, so client.ts forwards the file bytes here instead. dispatch_upload
+	// rebuilds the UploadFile list, runs the real upload handler, and STREAMS the
+	// resulting StateUpdates (incl. progress `yield`s) back as 'update' messages.
+	pyodide.globals.set('UPLOAD_JSON', JSON.stringify(uploadDict ?? {}));
+	const emit = (json: string) => self.postMessage({ type: 'update', update: JSON.parse(json) });
+	pyodide.globals.set('EMIT_UPDATE', emit);
+	await pyodide.runPythonAsync(`
+import json, traceback
+try:
+    await dispatch_upload(json.loads(UPLOAD_JSON), EMIT_UPDATE)
+except Exception:
+    EMIT_UPDATE(json.dumps({"delta": {}, "events": [], "final": True, "error": traceback.format_exc()}))
+`);
+	return { type: 'noop' };
+}
+
 self.onmessage = async (event: MessageEvent) => {
 	const { type, payload, id } = event.data ?? {};
 	try {
@@ -114,6 +133,9 @@ self.onmessage = async (event: MessageEvent) => {
 				break;
 			case 'event':
 				response = await handleEvent(payload.event);
+				break;
+			case 'upload':
+				response = await handleUpload(payload.upload);
 				break;
 			default:
 				response = { type: 'error', message: `unknown message type ${type}` };
