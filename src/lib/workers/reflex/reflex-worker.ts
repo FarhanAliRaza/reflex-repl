@@ -52,7 +52,7 @@ async function handleInit() {
 	if (parsed.fails?.length)
 		log(`Some optional installs were skipped: ${JSON.stringify(parsed.fails)}`);
 
-	// Define the render bridge (ReflexApp, _render, flatten_state, …) in the interpreter.
+	// Define the render bridge (compile_app, dispatch_event, …) in the interpreter.
 	pyodide.runPython(bridgePy);
 	log(`Reflex ${parsed.reflex} ready.`);
 	return { type: 'ready', reflex: parsed.reflex };
