@@ -92,15 +92,35 @@ def _patch_compile_for_pyodide():
     from reflex.utils import js_runtimes
     from reflex_base.config import get_config
 
-    # compile_state bridges async _resolve_delta via a thread when a loop is
-    # running (always, under runPythonAsync); Pyodide has no threads. Resolve
-    # synchronously (matters only for async computed vars, which are rare).
+    # compile_state bakes the initial (pre-hydrate) state into the frontend; it
+    # resolves async @rx.vars by offloading _resolve_delta to a thread (because
+    # _compile is sync but runs under a live loop). Pyodide has no threads. Set a
+    # sync fallback that skips resolution; compile_app overrides this with the
+    # async-resolved values just before compiling (see _resolve_initial_state).
     cu.compile_state = lambda state: cu._sorted_keys(
         state(_reflex_internal_init=True).dict(initial=True)
     )
     js_runtimes.install_frontend_packages = lambda *a, **k: None  # esm.sh at runtime
     rx.App._get_frontend_packages = lambda self, *a, **k: None
     get_config().telemetry_enabled = False
+
+
+async def _resolve_initial_state(state) -> None:
+    """Bake async-resolved initial vars into the compiler (Pyodide has no threads).
+
+    Reflex's `compile_state` would resolve `async @rx.var`s by running
+    `_resolve_delta` in a worker thread. We're already in an event loop here, so
+    resolve it directly and hand `compile_state` the finished dict — otherwise an
+    async var's baked initial value is null until the first hydration delta.
+    Must run after the state tree is built (user modules imported) and before
+    `app._compile()`.
+    """
+    from reflex.compiler import utils as cu
+    from reflex.state import _resolve_delta
+
+    initial = state(_reflex_internal_init=True).dict(initial=True)
+    resolved = cu._sorted_keys(await _resolve_delta(initial))
+    cu.compile_state = lambda _state: resolved
 
 
 def _read_web_and_runtime() -> dict:
@@ -188,6 +208,9 @@ async def compile_app(files: dict, entry: str = "app.py") -> dict:
 
         app = rx.App()
         app.add_page(page, route="/", on_load=on_load)
+        # Resolve async @rx.vars for the baked initial state before compiling
+        # (no threads under Pyodide; we're already in a loop here).
+        await _resolve_initial_state(rx.State)
         app._compile(use_rich=False)
         # on_load_internal resolves the route's load handlers via this app ref;
         # without it the handler falls back to loading the app from disk (no app

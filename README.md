@@ -101,9 +101,8 @@ is an experimental project — expect rough edges on advanced or unusual apps.
 The **frontend is high-fidelity** — real React, the full component library, and most
 third-party React libraries render faithfully. `dispatch_event` in `bridge.py` now drives
 Reflex's **real event pipeline** (`process_event`), so returned events, event chaining,
-incremental `yield` streaming, and `on_load` all work. The remaining gaps come from the
-no-server / no-bundler setup and the parts of Reflex that need threads or a second
-HTTP transport.
+incremental `yield` streaming, `on_load`, and `async @rx.var`s all work. The remaining
+gaps come from the no-server / no-bundler setup and Reflex's second HTTP transport.
 
 **Page-load handlers (`on_load`)**
 
@@ -111,11 +110,6 @@ HTTP transport.
   you, so it picks up a page-load handler from a **module-level `on_load`** in `app.py`
   (e.g. `on_load = State.load_data`, or a list of handlers) rather than from
   `@rx.page(on_load=...)`.
-
-**Event pipeline**
-
-- **Async computed vars are unreliable.** To avoid threads (which Pyodide lacks),
-  `compile_state` is resolved synchronously, which can break `@rx.var`s defined `async`.
 
 **Transports**
 
