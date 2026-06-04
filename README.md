@@ -83,9 +83,11 @@ pnpm test:unit    # Vitest unit tests
 4. **Render** — the bundle loads in a sandboxed iframe via an import map (esm.sh for
    npm packages, data/blob URLs for Reflex modules); React mounts the page.
 5. **Interact** — UI events are forwarded over `postMessage` to the worker, where
-   Reflex's event loop runs the handler and computes a state delta.
-6. **Update** — the delta flows back to the iframe, where Reflex's `state.js` applies
-   it and React re-renders.
+   Reflex's real event pipeline runs the handler, computing state deltas and any
+   returned events (`rx.redirect`, `rx.toast`, event chaining, …).
+6. **Update** — each delta/event the pipeline emits streams back to the iframe as its
+   own `StateUpdate` (so generator `yield`s arrive incrementally), where Reflex's
+   `state.js` applies it and React re-renders.
 
 ## Supported subset
 
@@ -97,22 +99,21 @@ is an experimental project — expect rough edges on advanced or unusual apps.
 ### Known limitations
 
 The **frontend is high-fidelity** — real React, the full component library, and most
-third-party React libraries render faithfully. The gaps below come from the **event
-bridge in `bridge.py` being a deliberately thin slice** of Reflex's real pipeline, plus
-the no-server / no-bundler setup.
+third-party React libraries render faithfully. `dispatch_event` in `bridge.py` now drives
+Reflex's **real event pipeline** (`process_event`), so returned events, event chaining,
+incremental `yield` streaming, and `on_load` all work. The remaining gaps come from the
+no-server / no-bundler setup and the parts of Reflex that need threads or a second
+HTTP transport.
+
+**Page-load handlers (`on_load`)**
+
+- **`on_load` runs, but you declare it differently.** The playground builds the page for
+  you, so it picks up a page-load handler from a **module-level `on_load`** in `app.py`
+  (e.g. `on_load = State.load_data`, or a list of handlers) rather than from
+  `@rx.page(on_load=...)`.
 
 **Event pipeline**
 
-- **`on_load` events don't fire.** `dispatch_event` skips any handler whose name starts
-  with `on_load`, so page-load handlers — initial data fetches, load-time redirects,
-  etc. — never run.
-- **Returned / "special" events are dropped.** The bridge always returns `"events": []`,
-  so events a handler *returns or yields* never reach the client: `rx.redirect`,
-  `rx.toast`, `rx.download`, `rx.call_script`, `rx.set_clipboard`, `rx.set_focus`, and
-  **event chaining** (one handler triggering another).
-- **No streaming / incremental `yield`.** For generator handlers, the bridge drains the
-  generator and sends only the **final** state delta — intermediate `yield` updates and
-  background-task progress don't stream.
 - **Async computed vars are unreliable.** To avoid threads (which Pyodide lacks),
   `compile_state` is resolved synchronously, which can break `@rx.var`s defined `async`.
 

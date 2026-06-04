@@ -67,8 +67,14 @@ console) on the right. It owns the worker and brokers all messages between the w
      calls. `compile_app` monkeypatches Reflex's compiler for Pyodide (no threads/bun/npm via
      `_patch_compile_for_pyodide`), wipes `.web` (Reflex never prunes stale content-hashed
      component modules), compiles the app, and returns a bundle of compiled `.web` modules +
-     Reflex's shipped client runtime. `dispatch_event` runs an event through the real pipeline
-     and returns a serialized `StateUpdate` delta.
+     Reflex's shipped client runtime. `dispatch_event` drives Reflex's **real** event pipeline
+     (`reflex_base`'s `process_event`) through a collecting `EventContext`, and **streams** each
+     `StateUpdate` (delta or events) as the pipeline emits it via an `emit` callback the worker
+     passes in. That's what makes returned events (`rx.redirect`/`rx.toast`/`rx.download`/…),
+     **event chaining** (chained backend events round-trip through `state.js`'s socket shim),
+     incremental generator `yield`s, and `on_load` (the internal `on_load_internal` handler is
+     allowed to run) work. First dispatch still hydrates the full state tree (a delta only
+     carries dirty vars). Headless harnesses call it with `emit=None` and just collect updates.
    - **Simple HTML-render path (legacy):** `run_app()` / `run_event()` / `ReflexApp` / `_render`.
      **Not wired into the worker** — it renders `rx.el` to plain HTML and exists for the headless
      harnesses. If you're fixing what the app actually shows, edit the parity path, not this one.
@@ -82,12 +88,16 @@ console) on the right. It owns the worker and brokers all messages between the w
 
 ### Event round-trip
 iframe Reflex runtime emits → `SOCKET_SHIM` posts `rx-emit` to parent → `Output.svelte` →
-`+page.svelte` `onEvent` → worker `event` → `dispatch_event` (real Python handler) → `StateUpdate`
-delta → back to `+page.svelte` `update` → `Output.applyUpdate` posts `rx-recv` into iframe →
-Reflex's `state.js` applies the delta → React re-renders.
+`+page.svelte` `onEvent` → worker `event` → `dispatch_event` (real Python pipeline) → one or
+more `StateUpdate`s streamed back as separate `update` messages → `+page.svelte` →
+`Output.applyUpdate` posts each `rx-recv` into iframe → Reflex's `state.js` applies the delta
+(and re-emits any chained backend events, closing the loop) → React re-renders.
 
 ### User app conventions
 - Entry file is `app.py`; it must define `index()` (or `page()`) returning a component.
+- `on_load` page-load handlers are read from a **module-level `on_load`** in `app.py` (e.g.
+  `on_load = State.load_data`, or a list) — the playground builds `add_page` itself, so
+  `@rx.page(on_load=...)` isn't wired up.
 - Re-running is made idempotent by purging the previous run's user modules (`reset_previous` →
   `reload_state_module`), because Reflex registers `rx.State` subclasses globally by module and a
   second import would raise "defined multiple times".

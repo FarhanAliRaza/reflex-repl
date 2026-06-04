@@ -83,17 +83,22 @@ _RESULT
 async function handleEvent(eventDict: Record<string, unknown>) {
 	if (!pyodide) throw new Error('worker not initialized');
 	pyodide.globals.set('EVENT_JSON', JSON.stringify(eventDict ?? {}));
-	// dispatch_event runs the Reflex event through the real pipeline and returns
-	// a serialized StateUpdate {delta, events, final} keyed by dotted substate.
-	const result = await pyodide.runPythonAsync(`
+	// dispatch_event runs the event through Reflex's real pipeline and STREAMS
+	// each StateUpdate {delta, events, final} via this callback as it is produced
+	// — so generator `yield`s, returned events (redirect/toast/chaining) and
+	// on_load all surface, instead of collapsing to one final delta. Each update
+	// is posted as its own 'update' message; the page applies them in order.
+	const emit = (json: string) => self.postMessage({ type: 'update', update: JSON.parse(json) });
+	pyodide.globals.set('EMIT_UPDATE', emit);
+	await pyodide.runPythonAsync(`
 import json, traceback
 try:
-    _RESULT = json.dumps(await dispatch_event(json.loads(EVENT_JSON)), default=str)
+    await dispatch_event(json.loads(EVENT_JSON), EMIT_UPDATE)
 except Exception:
-    _RESULT = json.dumps({"delta": {}, "events": [], "final": True, "error": traceback.format_exc()})
-_RESULT
+    EMIT_UPDATE(json.dumps({"delta": {}, "events": [], "final": True, "error": traceback.format_exc()}))
 `);
-	return { type: 'update', update: JSON.parse(result) };
+	// Updates were already streamed via EMIT_UPDATE; nothing more to post.
+	return { type: 'noop' };
 }
 
 self.onmessage = async (event: MessageEvent) => {
