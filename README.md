@@ -32,6 +32,8 @@ framework, so most Reflex apps render the same as they would in production.
 - **Real Reflex** — the actual framework running server-less in WebAssembly
 - **Full Radix component library** — `rx.button`, `rx.card`, `rx.vstack`, charts, etc.
 - **Live state & events** — `on_click`, `on_change`, `on_input`, … round-trip through Reflex's real event loop
+- **Returned events & chaining** — `rx.redirect`, `rx.toast`, `rx.download`, and one handler triggering another
+- **File uploads** — `rx.upload` works without a server (file bytes are forwarded to the worker)
 - **Multi-file projects** — split your app across files with inter-file imports
 - **Hot reload** — Refresh re-runs your code and resets state cleanly
 - **CodeMirror editor** — Python syntax highlighting, autocomplete, search
@@ -83,9 +85,11 @@ pnpm test:unit    # Vitest unit tests
 4. **Render** — the bundle loads in a sandboxed iframe via an import map (esm.sh for
    npm packages, data/blob URLs for Reflex modules); React mounts the page.
 5. **Interact** — UI events are forwarded over `postMessage` to the worker, where
-   Reflex's event loop runs the handler and computes a state delta.
-6. **Update** — the delta flows back to the iframe, where Reflex's `state.js` applies
-   it and React re-renders.
+   Reflex's real event pipeline runs the handler, computing state deltas and any
+   returned events (`rx.redirect`, `rx.toast`, event chaining, …).
+6. **Update** — each delta/event the pipeline emits streams back to the iframe as its
+   own `StateUpdate` (so generator `yield`s arrive incrementally), where Reflex's
+   `state.js` applies it and React re-renders.
 
 ## Supported subset
 
@@ -97,34 +101,17 @@ is an experimental project — expect rough edges on advanced or unusual apps.
 ### Known limitations
 
 The **frontend is high-fidelity** — real React, the full component library, and most
-third-party React libraries render faithfully. The gaps below come from the **event
-bridge in `bridge.py` being a deliberately thin slice** of Reflex's real pipeline, plus
-the no-server / no-bundler setup.
+third-party React libraries render faithfully. `dispatch_event` in `bridge.py` now drives
+Reflex's **real event pipeline** (`process_event`), so returned events, event chaining,
+incremental `yield` streaming, `on_load`, `async @rx.var`s, and `rx.upload` file uploads
+all work. The remaining gaps come from the no-server / no-bundler setup.
 
-**Event pipeline**
+**Page-load handlers (`on_load`)**
 
-- **`on_load` events don't fire.** `dispatch_event` skips any handler whose name starts
-  with `on_load`, so page-load handlers — initial data fetches, load-time redirects,
-  etc. — never run.
-- **Returned / "special" events are dropped.** The bridge always returns `"events": []`,
-  so events a handler *returns or yields* never reach the client: `rx.redirect`,
-  `rx.toast`, `rx.download`, `rx.call_script`, `rx.set_clipboard`, `rx.set_focus`, and
-  **event chaining** (one handler triggering another).
-- **No streaming / incremental `yield`.** For generator handlers, the bridge drains the
-  generator and sends only the **final** state delta — intermediate `yield` updates and
-  background-task progress don't stream.
-- **Async computed vars are unreliable.** To avoid threads (which Pyodide lacks),
-  `compile_state` is resolved synchronously, which can break `@rx.var`s defined `async`.
-
-**Transports**
-
-- **File uploads don't work.** Reflex uses two transports: a websocket for normal events
-  (swapped for `postMessage`) and a separate **HTTP `POST /_upload/`** for `rx.upload`.
-  Only the websocket is shimmed, so the upload request hits a backend that isn't there
-  and silently fails — `handle_upload` never runs. Wiring it up means intercepting the
-  upload `XMLHttpRequest` in the iframe (the way `socket.io-client` is shimmed),
-  forwarding the bytes to the worker, and handling them in `bridge.py`. More broadly,
-  anything assuming a live HTTP endpoint *other than the socket* needs its own shim.
+- **`on_load` runs, but you declare it differently.** The playground builds the page for
+  you, so it picks up a page-load handler from a **module-level `on_load`** in `app.py`
+  (e.g. `on_load = State.load_data`, or a list of handlers) rather than from
+  `@rx.page(on_load=...)`.
 
 **npm / frontend packages**
 

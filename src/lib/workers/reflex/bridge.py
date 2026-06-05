@@ -7,6 +7,7 @@ would carry — here it crosses postMessage instead.
 """
 
 import importlib
+import json
 import os
 import re
 import sys
@@ -82,6 +83,7 @@ _root = None
 _subs: dict = {}
 _hydrated = {"v": False}
 _root_full_name = ""
+_state_manager = None  # set by compile_app; used to build the event EventContext
 
 
 def _patch_compile_for_pyodide():
@@ -90,15 +92,35 @@ def _patch_compile_for_pyodide():
     from reflex.utils import js_runtimes
     from reflex_base.config import get_config
 
-    # compile_state bridges async _resolve_delta via a thread when a loop is
-    # running (always, under runPythonAsync); Pyodide has no threads. Resolve
-    # synchronously (matters only for async computed vars, which are rare).
+    # compile_state bakes the initial (pre-hydrate) state into the frontend; it
+    # resolves async @rx.vars by offloading _resolve_delta to a thread (because
+    # _compile is sync but runs under a live loop). Pyodide has no threads. Set a
+    # sync fallback that skips resolution; compile_app overrides this with the
+    # async-resolved values just before compiling (see _resolve_initial_state).
     cu.compile_state = lambda state: cu._sorted_keys(
         state(_reflex_internal_init=True).dict(initial=True)
     )
     js_runtimes.install_frontend_packages = lambda *a, **k: None  # esm.sh at runtime
     rx.App._get_frontend_packages = lambda self, *a, **k: None
     get_config().telemetry_enabled = False
+
+
+async def _resolve_initial_state(state) -> None:
+    """Bake async-resolved initial vars into the compiler (Pyodide has no threads).
+
+    Reflex's `compile_state` would resolve `async @rx.var`s by running
+    `_resolve_delta` in a worker thread. We're already in an event loop here, so
+    resolve it directly and hand `compile_state` the finished dict — otherwise an
+    async var's baked initial value is null until the first hydration delta.
+    Must run after the state tree is built (user modules imported) and before
+    `app._compile()`.
+    """
+    from reflex.compiler import utils as cu
+    from reflex.state import _resolve_delta
+
+    initial = state(_reflex_internal_init=True).dict(initial=True)
+    resolved = cu._sorted_keys(await _resolve_delta(initial))
+    cu.compile_state = lambda _state: resolved
 
 
 def _read_web_and_runtime() -> dict:
@@ -144,12 +166,13 @@ async def compile_app(files: dict, entry: str = "app.py") -> dict:
 
     Returns the module bundle the iframe needs, or {"error": traceback}.
     """
-    global _root, _subs, _hydrated, _root_full_name
+    global _root, _subs, _hydrated, _root_full_name, _state_manager
     import traceback
 
     from reflex_base.registry import RegistrationContext
     from reflex.istate.manager import StateManager
     from reflex.istate.manager.token import BaseStateToken
+    from reflex.state import OnLoadInternalState
 
     try:
         # ensure_context FIRST: reset_previous → reload_state_module reads the
@@ -168,6 +191,10 @@ async def compile_app(files: dict, entry: str = "app.py") -> dict:
         page = getattr(module, "index", None) or getattr(module, "page", None)
         if page is None:
             return {"error": "Define an index() function that returns a component."}
+        # on_load: the REPL builds add_page itself, so a user's page-load handler
+        # is picked up from a module-level `on_load = State.handler` (or list).
+        # Without this, app.get_load_events("/") is empty and on_load never fires.
+        on_load = getattr(module, "on_load", None)
 
         # Wipe .web before compiling: Reflex writes per-component files under
         # content-hashed names and never prunes old ones, so editing/re-running
@@ -180,10 +207,18 @@ async def compile_app(files: dict, entry: str = "app.py") -> dict:
         shutil.rmtree(str(prerequisites.get_web_dir()), ignore_errors=True)
 
         app = rx.App()
-        app.add_page(page, route="/")
+        app.add_page(page, route="/", on_load=on_load)
+        # Resolve async @rx.vars for the baked initial state before compiling
+        # (no threads under Pyodide; we're already in a loop here).
+        await _resolve_initial_state(rx.State)
         app._compile(use_rich=False)
+        # on_load_internal resolves the route's load handlers via this app ref;
+        # without it the handler falls back to loading the app from disk (no app
+        # on disk under Pyodide) and raises.
+        OnLoadInternalState._app_ref = app
 
         sm = StateManager.create()
+        _state_manager = sm
         token = BaseStateToken(ident="repl", cls=rx.State)
         _root = await sm.get_state(token)
         _root_full_name = rx.State.get_full_name()
@@ -204,42 +239,210 @@ async def compile_app(files: dict, entry: str = "app.py") -> dict:
         return {"error": traceback.format_exc()[-2500:]}
 
 
-async def dispatch_event(msg) -> dict:
-    """Process a Reflex Event dict from the client → a serialized StateUpdate.
+def _serialize_events(events) -> list:
+    """Serialize Reflex Event objects into the {name, payload} dicts state.js wants.
 
-    First call hydrates (full state + is_hydrated=true); later calls return the
-    changed delta. Keyed by dotted substate names — exactly what state.js applies.
+    Frontend events (name starts with "_": _redirect, _call_function/toast,
+    _download, _set_focus, …) are applied client-side; backend events (chained
+    handlers) are re-emitted by state.js back to us — the socket-shim round-trip.
     """
+    return [
+        {"name": e.name, "payload": e.payload, "router_data": e.router_data}
+        for e in events
+    ]
+
+
+def _make_push(collected: list, emit):
+    """A `_push(update)` that collects updates and streams each via `emit`."""
+
+    def _push(update: dict) -> None:
+        # Drop no-op updates so streaming doesn't spam empty frames.
+        if not update.get("delta") and not update.get("events") and not update.get("error"):
+            return
+        collected.append(update)
+        if emit is not None:
+            emit(json.dumps(update, default=str))
+
+    return _push
+
+
+def _collecting_event_context(push):
+    """An EventContext whose emit hooks stream each StateUpdate via `push`.
+
+    emit_delta → state delta; emit_event → frontend events; enqueue → chained
+    backend events (forwarded for state.js to re-emit). Shared by dispatch_event
+    and dispatch_upload so both honor Reflex's real pipeline output.
+    """
+    from reflex_base.event.context import EventContext
+
+    async def _emit_delta(token, delta):
+        push({"delta": dict(delta), "events": [], "final": False})
+
+    async def _emit_event(token, *events):
+        push({"delta": {}, "events": _serialize_events(events), "final": False})
+
+    async def _enqueue(token, *events):
+        push({"delta": {}, "events": _serialize_events(events), "final": False})
+
+    return EventContext(
+        token="repl",
+        state_manager=_state_manager,
+        enqueue_impl=_enqueue,
+        emit_delta_impl=_emit_delta,
+        emit_event_impl=_emit_event,
+    )
+
+
+async def dispatch_event(msg, emit=None) -> dict:
+    """Run a Reflex Event dict through Reflex's REAL event pipeline.
+
+    Each delta/event the genuine pipeline produces is a StateUpdate
+    `{delta, events, final}` — exactly what state.js applies. Where the old
+    bridge dropped returned events and only sent the final delta, this drives
+    `process_event` so the full pipeline is honored:
+
+    - **Returned / yielded events** (`rx.redirect`, `rx.toast`, `rx.download`,
+      `rx.call_script`, `rx.set_clipboard/_focus`, and event *chaining*) flow
+      out via `events`; chained backend events round-trip through state.js.
+    - **Streaming**: each generator `yield` emits its own delta update, streamed
+      via `emit` as it happens (instead of collapsing to the final state).
+    - **on_load**: the internal `on_load_internal` handler is allowed to run and
+      enqueue the route's load handlers.
+
+    `emit` is a callback the worker supplies (posts each update to the page). It
+    is called with a JSON string per update. When omitted (headless harnesses)
+    updates are only collected. Returns a small status `{final, n}`.
+    """
+    collected: list = []
+    _push = _make_push(collected, emit)
+
     if _root is None:
-        return {"delta": {}, "events": [], "final": True, "error": "no app"}
+        _push({"delta": {}, "events": [], "final": True, "error": "no app"})
+        return {"final": True, "n": len(collected)}
+
+    from reflex.istate.data import RouterData
     from reflex.state import _resolve_delta
+    from reflex_base.event.context import EventContext
+    from reflex_base.event.processor.base_state_processor import process_event
 
     name = msg.get("name", "") if isinstance(msg, dict) else ""
+    payload = msg.get("payload") or {}
+    router_data = (msg.get("router_data") or {}) if isinstance(msg, dict) else {}
     sfn, _, fn = name.rpartition(".")
     cls = _subs.get(sfn)
-    if cls is not None and fn and "internal" not in fn and not fn.startswith("on_load"):
+
+    # Apply router_data so handlers reading self.router resolve correctly — and
+    # so on_load_internal can look up the current route's on_load handlers.
+    if router_data and _root.router_data != router_data:
+        _root.router_data = router_data
+        _root.router = RouterData.from_router_data(router_data)
+
+    ctx = _collecting_event_context(_push)
+    ctx_token = EventContext.set(ctx)
+    try:
+        # First dispatch hydrates: the client needs the FULL initial state (a
+        # delta carries only dirty vars), so send the whole tree + is_hydrated.
+        # The first event is the client's `hydrate`; its own handler only sets
+        # is_hydrated / client storage (unsupported here), so we skip running it.
+        if not _hydrated["v"]:
+            _hydrated["v"] = True
+            full = await _resolve_delta(_root.dict())
+            if _root_full_name in full:
+                full[_root_full_name]["is_hydrated_rx_state_"] = True
+            _root._clean()
+            _push({"delta": full, "events": [], "final": True})
+            return {"final": True, "n": len(collected)}
+
+        # Run the handler through the real pipeline. on_load_internal is internal
+        # but must run for page-load handlers to fire; other internal handlers
+        # (hydrate, client-storage sync) are intentionally left out.
+        if cls is not None and fn and (fn == "on_load_internal" or "internal" not in fn):
+            handler = cls.event_handlers.get(fn)
+            if handler is not None:
+                sub = await _root.get_state(cls)
+                await process_event(
+                    handler=handler, payload=payload, state=sub, root_state=_root
+                )
+    finally:
+        EventContext.reset(ctx_token)
+
+    return {"final": True, "n": len(collected)}
+
+
+async def dispatch_upload(msg, emit=None) -> dict:
+    """Handle an `rx.upload` whose files the iframe forwarded over postMessage.
+
+    Reflex uploads go over a SEPARATE HTTP `POST /_upload/`, not the socket —
+    there's no server here, so client.ts replaces Reflex's `uploadFiles` helper
+    with one that posts the file bytes to the worker instead. This rebuilds the
+    `UploadFile` list (the real `_upload_buffered_file` does the same from the
+    multipart body), runs the genuine upload handler through the pipeline, and
+    streams the resulting deltas/events back exactly like a normal event — so
+    progress `yield`s and returned events work too.
+
+    `msg` is `{name: "<state>.<handler>", files: [{name, b64}, …]}`. `emit` is
+    the worker's per-update callback (same contract as dispatch_event).
+    """
+    collected: list = []
+    _push = _make_push(collected, emit)
+
+    if _root is None:
+        _push({"delta": {}, "events": [], "final": True, "error": "no app"})
+        return {"final": True, "n": len(collected)}
+
+    import base64
+    import tempfile
+    from pathlib import Path
+
+    from reflex_base.event import resolve_upload_handler_param
+    from reflex_base.event.context import EventContext
+    from reflex_base.event.processor.base_state_processor import process_event
+    from reflex_components_core.core._upload import UploadFile
+    from starlette.datastructures import Headers
+
+    name = msg.get("name") or msg.get("handler") or ""
+    files_in = msg.get("files") or []
+    sfn, _, fn = name.rpartition(".")
+    cls = _subs.get(sfn)
+    handler = cls.event_handlers.get(fn) if cls is not None else None
+    if handler is None:
+        _push({"delta": {}, "events": [], "final": True, "error": f"no upload handler '{name}'"})
+        return {"final": True, "n": len(collected)}
+
+    # The handler's `list[rx.UploadFile]` parameter name (what the payload keys on).
+    try:
+        param_name, _ann = resolve_upload_handler_param(handler)
+    except Exception:
+        param_name = "files"
+
+    uploads = []
+    for f in files_in:
+        data = base64.b64decode(f.get("b64") or "")
+        # Back each file with an *unrolled* SpooledTemporaryFile so Starlette's
+        # UploadFile.read() takes the in-memory branch (a plain BytesIO has no
+        # `_rolled`, which would route read() through a threadpool — Pyodide has
+        # no threads).
+        spool = tempfile.SpooledTemporaryFile(max_size=len(data) + 1)
+        spool.write(data)
+        spool.seek(0)
+        fname = f.get("name") or "upload"
+        uploads.append(
+            UploadFile(
+                file=spool,
+                path=Path(fname.lstrip("/")),
+                size=len(data),
+                headers=Headers(),
+            )
+        )
+
+    ctx = _collecting_event_context(_push)
+    ctx_token = EventContext.set(ctx)
+    try:
         sub = await _root.get_state(cls)
-        handler = getattr(sub, fn, None)
-        if handler is not None:
-            payload = msg.get("payload") or {}
-            result = handler(**payload) if isinstance(payload, dict) and payload else handler()
-            if hasattr(result, "__await__"):
-                await result
-            elif hasattr(result, "__anext__"):
-                async for _ in result:
-                    pass
-            elif hasattr(result, "__next__"):
-                for _ in result:
-                    pass
+        await process_event(
+            handler=handler, payload={param_name: uploads}, state=sub, root_state=_root
+        )
+    finally:
+        EventContext.reset(ctx_token)
 
-    if not _hydrated["v"]:
-        _hydrated["v"] = True
-        full = await _resolve_delta(_root.dict())
-        if _root_full_name in full:
-            full[_root_full_name]["is_hydrated_rx_state_"] = True
-        _root._clean()
-        return {"delta": full, "events": [], "final": True}
-
-    delta = await _root._get_resolved_delta()
-    _root._clean()
-    return {"delta": delta, "events": [], "final": True}
+    return {"final": True, "n": len(collected)}

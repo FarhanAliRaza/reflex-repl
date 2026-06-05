@@ -9,6 +9,10 @@ node_modules
 /.svelte-kit
 /build
 ignore/
+# Python (Pyodide bridge .py files are loaded as raw text; bytecode is cruft)
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db

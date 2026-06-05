@@ -14,9 +14,12 @@
 		// A user event bubbled up from Reflex's runtime in the iframe (the dict its
 		// socket would have emitted). Parent forwards it to the worker pipeline.
 		onEvent: (event: Record<string, unknown>) => void;
+		// An rx.upload bubbled up from the iframe (handler name + file bytes). Parent
+		// forwards it to the worker, which runs the real upload handler.
+		onUpload: (upload: Record<string, unknown>) => void;
 	}
 
-	let { bundle, error, renderId, onEvent }: Props = $props();
+	let { bundle, error, renderId, onEvent, onUpload }: Props = $props();
 
 	let iframeElement = $state<HTMLIFrameElement | null>(null);
 
@@ -48,6 +51,7 @@
 		const handleMessage = (event: MessageEvent) => {
 			const d = event.data;
 			if (d?.type === 'rx-emit') onEvent(d.event);
+			else if (d?.type === 'rx-upload') onUpload(d.upload);
 		};
 		window.addEventListener('message', handleMessage);
 		return () => window.removeEventListener('message', handleMessage);
@@ -65,7 +69,7 @@
 								bind:this={iframeElement}
 								title="Reflex Output"
 								src={iframeSrc}
-								sandbox="allow-scripts allow-popups allow-same-origin"
+								sandbox="allow-scripts allow-popups allow-same-origin allow-downloads"
 								class="h-full w-full border-none bg-white"
 							></iframe>
 						{/key}
