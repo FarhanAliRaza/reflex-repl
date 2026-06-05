@@ -69,7 +69,7 @@
 								bind:this={iframeElement}
 								title="Reflex Output"
 								src={iframeSrc}
-								sandbox="allow-scripts allow-popups allow-same-origin"
+								sandbox="allow-scripts allow-popups allow-same-origin allow-downloads"
 								class="h-full w-full border-none bg-white"
 							></iframe>
 						{/key}

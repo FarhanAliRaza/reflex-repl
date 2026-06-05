@@ -114,19 +114,22 @@ export const uploadFiles = async (
 `;
 
 // Mounts the compiled page through Reflex's real providers (memory router so the
-// widget owns its URL space). EventLoopProvider opens the (shimmed) socket.
+// widget owns its URL space). EventLoopProvider opens the (shimmed) socket;
+// UploadFilesProvider supplies the UploadFilesContext that rx.upload's dropzone
+// reads (without it useContext(UploadFilesContext) is null → not iterable).
 const BOOT = String.raw`
 import { createElement as h } from "react";
 import { createRoot } from "react-dom/client";
 import { Theme } from "@radix-ui/themes";
 import { MemoryRouter } from "react-router";
 import Page from "$/app/routes/_index";
-import { StateProvider, EventLoopProvider } from "$/utils/context";
+import { StateProvider, EventLoopProvider, UploadFilesProvider } from "$/utils/context";
 try {
   const tree = h(MemoryRouter, { initialEntries: ["/"] },
     h(StateProvider, null,
       h(EventLoopProvider, null,
-        h(Theme, { appearance: "inherit" }, h(Page)))));
+        h(UploadFilesProvider, null,
+          h(Theme, { appearance: "inherit" }, h(Page))))));
   createRoot(document.getElementById("reflex-root")).render(tree);
 } catch (e) {
   document.getElementById("reflex-root").textContent = "Mount error: " + e.message;
