@@ -66,7 +66,7 @@ test.afterAll(async () => {
 });
 
 test('renders the default Reflex app inside the sandboxed iframe', async () => {
-	await expect(app.getByText('🐍 Pure Python, zero setup')).toBeVisible();
+	await expect(app.getByText('🐍 Zero Setup, Reflex in browser')).toBeVisible();
 	await expect(app.getByRole('heading', { name: COUNT })).toHaveText('0');
 	await expect(app.getByText('Hey world 👋')).toBeVisible();
 });

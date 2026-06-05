@@ -14,7 +14,7 @@ def index() -> rx.Component:
     return rx.center(
         rx.vstack(
             rx.badge(
-                "🐍 Pure Python, zero setup", variant="soft", radius="full", size="2"
+                "🐍 Zero Setup, Reflex in browser", variant="soft", radius="full", size="2"
             ),
             rx.heading(
                 "Reflex, running in your browser", size="8", weight="bold", align="center"
